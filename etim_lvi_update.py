@@ -21,6 +21,28 @@ from datetime import datetime
 import pandas as pd
 import os
 
+
+def load_env_file():
+    env_path = '.env'
+    if not os.path.exists(env_path):
+        return
+
+    with open(env_path, 'r', encoding='utf-8') as env_file:
+        for line in env_file:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if '=' not in stripped:
+                continue
+            key, value = stripped.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_env_file()
+
 TAG = 'lvi'
 UPDATE_INRIVER = True
 LVI_SUPPLIERS_FILE = 'lvi_suppliers_update.json'    # local file to define which suppliers
@@ -210,13 +232,13 @@ def transform_lvi_etim_specification(item) -> json:
 # Remove Items which do not have ItemETIMClassGroup (ETIMClass has been deleted from dynamic database)
 # Remove Items which do not have any ETIM features
 # Return updated Inriver json with ItemETIMClass/ItemETIMClassGroup
-def update_and_filter_inriver_items(tt_items_json, inriver_items_json, etim_classes_json) -> json:
+def update_and_filter_inriver_items(tt_items_json, inriver_items_json, etim_classes_json) -> tuple:
     if not isinstance(etim_classes_json, list) or not etim_classes_json:
         logger.error("ETIM class CVL is missing or invalid.")
-        return []
+        return [], [], []
     if not isinstance(tt_items_json, list):
         logger.error("TT items JSON is not a list.")
-        return []
+        return [], [], []
 
     etim_class_map = {item.get("key"): item.get("parentKey") for item in etim_classes_json if isinstance(item, dict)}
     tt_items_dict = {
@@ -224,6 +246,8 @@ def update_and_filter_inriver_items(tt_items_json, inriver_items_json, etim_clas
         for item in tt_items_json if isinstance(item, dict) and item.get("TT020")
     }
     changed_items = []
+    missing_lvis_numbers = []
+    items_to_remove = []  # Inriver entity IDs that should be removed
     datenow = datetime.now().strftime("%Y-%m-%d")
 
     # Iterate through inriver_items_json and update ItemETIMClassGroup and ItemETIMClass
@@ -333,10 +357,43 @@ def update_and_filter_inriver_items(tt_items_json, inriver_items_json, etim_clas
                     do_update = False
 
         else:
-            logger.warning(f'item_lvis_number {item_lvis_number} from Inriver not found from LVIS data')
+            # Collect missing LVIS numbers and entity IDs for removal
+            if item_lvis_number:
+                missing_lvis_numbers.append(item_lvis_number)
+                entity_id = result_row.get("entityId")
+                if entity_id:
+                    items_to_remove.append(entity_id)
             do_update = False
 
-    return changed_items
+    return changed_items, missing_lvis_numbers, items_to_remove
+
+
+def get_duplicate_key_pairs(inriver_items_json, keyfield):
+    counts = {}
+    for row in inriver_items_json:
+        field_values = row.get('fieldValues')
+        if not isinstance(field_values, list):
+            continue
+        values = {fv.get('fieldTypeId'): fv.get('value') for fv in field_values if isinstance(fv, dict)}
+        key = (values.get(keyfield), values.get('ItemSupplierNumber'))
+        if not all(key):
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
+def filter_out_duplicate_key_rows(items_json, keyfield, duplicate_keys):
+    filtered = []
+    for row in items_json:
+        field_values = row.get('fieldValues')
+        if not isinstance(field_values, list):
+            continue
+        values = {fv.get('fieldTypeId'): fv.get('value') for fv in field_values if isinstance(fv, dict)}
+        key = (values.get(keyfield), values.get('ItemSupplierNumber'))
+        if key in duplicate_keys:
+            continue
+        filtered.append(row)
+    return filtered
 
 
 # LVI
@@ -372,10 +429,15 @@ def handler() -> bool:
                 logger.info(f'No Inriver items to update for {supplierVat}')
                 continue
 
+            duplicate_keys = get_duplicate_key_pairs(inriver_items_json, 'ItemLVINumber')
+            if duplicate_keys:
+                logger.error(f'Supplier {supplierVat} has {len(duplicate_keys)} duplicate ItemLVINumber+ItemSupplierNumber keys in Inriver; ambiguous items will be skipped.')
+                logger.error(f'Duplicate keys sample: {list(duplicate_keys)[:10]}')
+                inriver_items_json = filter_out_duplicate_key_rows(inriver_items_json, 'ItemLVINumber', duplicate_keys)
+
             # Get etim-stk json from Azure blob (updated by etim-monitor)
             etim_filename = f'etim-{TAG}-{supplierVat}.json'
             blob_name = f"{BLOB_DIRECTORY_PATH}{etim_filename}"
-            tt_json = download_from_blob(BLOB_CONTAINER_NAME, blob_name)
             if tt_json is None:
                 logger.error(f"Skipping supplier {supplierVat} due to missing blob data: {blob_name}")
                 continue
@@ -389,9 +451,18 @@ def handler() -> bool:
             #with open(etim_filename, 'r', encoding='utf-8') as infile:
             #    tt_json = json.load(infile)  # Load JSON data from the file
 
-            filtered_inriver_items_json = update_and_filter_inriver_items(tt_json, inriver_items_json, etim_classes_json)
+            filtered_inriver_items_json, missing_lvis_numbers, items_to_remove = update_and_filter_inriver_items(tt_json, inriver_items_json, etim_classes_json)
             inriver_items_len = len(filtered_inriver_items_json)
             logger.info(f'filtered_inriver_items_json length: {inriver_items_len}')
+            
+            # Log summary of missing LVIS numbers
+            if missing_lvis_numbers:
+                logger.warning(f'{len(missing_lvis_numbers)} items from Inriver not found in LVIS data: {missing_lvis_numbers[:10]}{"..." if len(missing_lvis_numbers) > 10 else ""}')
+            
+            # Log items that should be removed from Inriver
+            if items_to_remove:
+                logger.info(f'{len(items_to_remove)} Inriver items should be removed (no longer in source data): {items_to_remove[:10]}{"..." if len(items_to_remove) > 10 else ""}')
+            
             save_to_json_file(filtered_inriver_items_json, f'etim-{TAG}-{supplierVat}-inriver.json')
             #save_to_excel_file(filtered_inriver_items_json, f'etim-{TAG}-inriver-{supplierVat}.xlsx')
 
